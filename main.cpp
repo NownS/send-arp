@@ -174,7 +174,7 @@ int main(int argc, char* argv[]) {
     for(int i=2,j=0;i<argc;i=i+2,j++){
         ret = resolve_mac(sender_mac_arr+j, handle, attacker_mac, attacker_ip, Ip(argv[i]));
         if (ret != 0){
-            fprintf(stderr, "couldn't find my Mac addr of %s\n", argv[i]);
+            fprintf(stderr, "couldn't find Mac addr of %s\n", argv[i]);
             return -1;
         }
     }
@@ -184,8 +184,7 @@ int main(int argc, char* argv[]) {
         for(int i=2,j=0;i<argc;i=i+2,j++){
             ret = sendARP_reply(handle, sender_mac_arr[j], attacker_mac, Ip(argv[i+1]), Ip(argv[i]));
             if (ret != 0){
-                fprintf(stderr, "couldn't find my Mac addr of %s\n", argv[i]);
-                return -1;
+                fprintf(stderr, "couldn't spoof %s to %s\n", argv[i], argv[i+1]);
             }
         }
     }
@@ -193,7 +192,6 @@ int main(int argc, char* argv[]) {
     delete[] sender_mac_arr;
     pcap_close(handle);
 }
-
 
 
 
